@@ -1,0 +1,64 @@
+# Runs natively under launchd (datadog.otelcol, run-collector.sh), no Docker and no Datadog Agent: OTLP on 4318
+# (Claude Code, local scripts) and DogStatsD on 8125 (local scripts), sent straight to us5.
+# Claude Code's model-call spans carry no gen_ai.operation.name nor gen_ai.usage.*, so LLM Observability
+# files them as workflow steps without tokens. This names them as chat calls and copies the token counts.
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 127.0.0.1:4318
+  statsd:
+    endpoint: 127.0.0.1:8125
+    transport: udp
+processors:
+  batch:
+  transform:
+    error_mode: ignore
+    trace_statements:
+      - context: span
+        conditions:
+          - name == "claude_code.llm_request"
+        statements:
+          - set(attributes["gen_ai.operation.name"], "chat")
+          - set(attributes["gen_ai.usage.output_tokens"], attributes["output_tokens"])
+          - set(attributes["gen_ai.usage.input_tokens"], attributes["input_tokens"] + attributes["cache_read_tokens"] + attributes["cache_creation_tokens"])
+          - set(attributes["gen_ai.usage.cache_read.input_tokens"], attributes["cache_read_tokens"])
+          - set(attributes["gen_ai.usage.cache_creation.input_tokens"], attributes["cache_creation_tokens"])
+      # Gives tool spans their command as input. A failure is marked only on the child claude_code.tool.execution span
+      # (filed as a workflow), not on claude_code.tool, so the Tools table still shows 0% errors: a span cannot see its child here.
+      - context: span
+        conditions:
+          - IsMatch(name, "^claude_code\\.tool")
+        statements:
+          - set(attributes["gen_ai.tool.call.arguments"], attributes["full_command"]) where attributes["full_command"] != nil
+          - set(attributes["gen_ai.tool.call.result"], attributes["output"]) where attributes["output"] != nil
+connectors:
+  datadog/connector:
+exporters:
+  datadog:
+    api:
+      key: ${env:DD_API_KEY}
+      site: us5.datadoghq.com
+    hostname: mr-mac
+service:
+  telemetry:
+    metrics:
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 127.0.0.1
+                port: 8888
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [transform, batch]
+      exporters: [datadog/connector, datadog]
+    metrics:
+      receivers: [otlp, statsd, datadog/connector]
+      processors: [batch]
+      exporters: [datadog]
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [datadog]
